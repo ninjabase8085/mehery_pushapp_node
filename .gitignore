@@ -1,0 +1,8 @@
+# Ignore docs folder
+/docs/
+
+# Ignore uploads folder
+/uploads/
+
+# Ignore support_files folder
+/support_files/
