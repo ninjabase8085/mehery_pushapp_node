@@ -429,111 +429,105 @@ router.post("/logout", async (req, res) => {
 
 // Endpoint to send notification using user_id
 router.post("/send-notification-by-user", async (req, res) => {
-  const { user_id, title, message, bundle_id, image_url,app_id,company_id,platform,category } = req.body;
+  const { user_id, title, message, bundle_id, image_url, app_id, company_id, platform, category } = req.body;
 
   if (!user_id || !message) {
-      return res.status(400).json({ error: "User ID and message are required" });
+    return res.status(400).json({ error: "User ID and message are required" });
   }
 
   try {
-      const company = await Company.findOne({ company_id });
-      if (!company) {
-          return res.status(404).json({ error: "Company not found" });
+    const company = await Company.findOne({ company_id });
+    if (!company) {
+      return res.status(404).json({ error: "Company not found" });
+    }
+
+    // Find the app within the company
+    const app = company.apps.find(app => app.app_id === app_id);
+    if (!app) {
+      return res.status(404).json({ error: "App not found" });
+    }
+
+    // Define the file paths for the app from the 'docs' folder
+    const appFolderPath = path.join(__dirname, '..', 'docs', `${company_id}_${app_id}`);
+    const apnKeyFilePath = path.resolve(appFolderPath, 'ios.p8');
+    const firebaseKeyFilePath = path.resolve(appFolderPath, 'android.json');
+    const huaweiKeyFilePath = path.resolve(appFolderPath, 'huawei.json');
+
+    // Find the device token and platform by user_id
+    const deviceRecord = await DeviceToken.findOne({ user_id, platform, company_id });
+
+    if (!deviceRecord) {
+      return res.status(404).json({ error: "Device token not found for the given user ID" });
+    }
+    if (!deviceRecord.status) {
+      return res.status(404).json({ error: "User not active" });
+    }
+
+    const { token } = deviceRecord;
+    
+    // Handling notifications based on platform
+    if (platform === "ios") {
+      const apnProvider = new apn.Provider({
+        token: {
+          key: apnKeyFilePath, // Reference the .p8 file
+          keyId: app.key_id, // Use app-specific keyId
+          teamId: app.team_id, // Use app-specific teamId
+        },
+        production: false, // Set to `true` for production
+      });
+
+      const notification = new apn.Notification();
+      notification.alert = message;
+      notification.sound = "default";
+      notification.topic = bundle_id; // Your app's bundle ID
+      if (category) {
+        notification.category = category;
       }
-      console.log(company);
-      // Find the app within the company
-      const app = company.apps.find(app => app.app_id === app_id);
-      if (!app) {
-          return res.status(404).json({ error: "App not found" });
+      if (image_url) {
+        notification.mutableContent = 1; // Required for rich media
+        notification.payload = { "media-url": image_url };
       }
 
-      // Define the file paths for the app from the 'docs' folder
-      const appFolderPath = path.join(__dirname, '..', 'docs', `${company_id}_${app_id}`);
-      console.log("App folder path:", appFolderPath); // Debugging path
+      const result = await apnProvider.send(notification, token);
+      apnProvider.shutdown(); // Close the APNs provider
 
-      const apnKeyFilePath = path.resolve(appFolderPath, 'ios.p8');
-      const firebaseKeyFilePath = path.resolve(appFolderPath, 'android.json');
-      const huaweiKeyFilePath = path.resolve(appFolderPath, 'huawei.json');
+      return res.status(200).json({ success: true, result });
 
-      // Log the full paths for debugging
-      console.log("APN Key File Path:", apnKeyFilePath);
-      console.log("Firebase Key File Path:", firebaseKeyFilePath);
-      console.log("Huawei Key File Path:", huaweiKeyFilePath);
-      console.log(app.key_id);
-      // Find the device token and platform by user_id
-      const deviceRecord = await DeviceToken.findOne({ user_id,platform,company_id });
+    } else if (platform === "android") {
+      // Initialize Firebase with a unique app name to avoid conflicts
+      const firebaseApp = admin.initializeApp({
+        credential: admin.credential.cert(require(firebaseKeyFilePath)), // Reference Firebase JSON file
+      }, `app_${company_id}_${deviceRecord.device_id}`);  // Use unique name
 
-      if (!deviceRecord) {
-          return res.status(404).json({ error: "Device token not found for the given user ID" });
-      }
-      if(!deviceRecord.status){
-        return res.status(404).json({ error: "User not active" });
-      }
+      const messageData = {
+        token: token,
+        notification: {
+          title: title,
+          body: message,
+          image: image_url || undefined, // Include image if provided
+        },
+      };
 
-      const { token } = deviceRecord;
-      if (platform === "ios") {
-          const apnProvider = new apn.Provider({
-            token: {
-                key: apnKeyFilePath, // Reference the .p8 file
-                keyId: app.key_id, // Use app-specific keyId
-                teamId: app.team_id, // Use app-specific teamId
-            },
-            production: false, // Set to `true` for production
-        });
+      const response = await firebaseApp.messaging().send(messageData);
 
-        const notification = new apn.Notification();
-        notification.alert = message;
-        notification.sound = "default";
-        notification.topic = bundle_id; // Your app's bundle ID
-        if (category) {
-            notification.category = category;
-        }
-        if (image_url) {
-            notification.mutableContent = 1; // Required for rich media
-            notification.payload = { "media-url": image_url };
-        }
+      // Clean up by deleting the Firebase app instance
+      admin.app(`app_${company_id}_${deviceRecord.device_id}`).delete(); 
 
-        const result = await apnProvider.send(notification, token);
-        apnProvider.shutdown(); // Close the APNs provider
-
-        return res.status(200).json({ success: true, result });
-
-      }else if (platform === "android") {
-        // Handling Firebase notifications for Android
-        const firebaseApp = admin.initializeApp({
-            credential: admin.credential.cert(require(firebaseKeyFilePath)), // Reference Firebase JSON file
-        }, `app_${company_id}`);
-
-        const messageData = {
-            token: token,
-            notification: {
-                title: title,
-                body: message,
-                image: image_url || undefined, // Include image if provided
-            },
-        };
-
-        const response = await firebaseApp.messaging().send(messageData);
-
-        // Clean up
-        admin.app(`app_${company_id}`).delete(); // Delete Firebase app instance
-
-        return res.status(200).json({ success: true, response });
+      return res.status(200).json({ success: true, response });
 
     } else if (platform === "huawei") {
-        // Handling Huawei notifications
-        const huaweiKeyFile = require(huaweiKeyFilePath); // Reference Huawei JSON file
+      const huaweiKeyFile = require(huaweiKeyFilePath); // Reference Huawei JSON file
 
-        // Use Huawei's push service to send the notification (assumed similar to Firebase)
-        const response = await sendHuaweiNotification(huaweiKeyFile, token, title, message, image_url);
+      // Use Huawei's push service to send the notification (assumed similar to Firebase)
+      const response = await sendHuaweiNotification(huaweiKeyFile, token, title, message, image_url);
 
-        return res.status(200).json({ success: true, response });
+      return res.status(200).json({ success: true, response });
 
     } else {
-        return res.status(400).json({ error: "Invalid platform" });
+      return res.status(400).json({ error: "Invalid platform" });
     }
   } catch (error) {
-      res.status(500).json({ error: "Failed to send notification", details: error.message });
+    res.status(500).json({ error: "Failed to send notification", details: error.message });
   }
 });
 
@@ -575,7 +569,7 @@ router.post("/send-notification-bulk", async (req, res) => {
     // Send notifications based on platform
     const responses = [];
     for (const device of deviceTokens) {
-      const { platform, token } = device;
+      const { platform, token, device_id } = device;
 
       try {
         if (platform === "ios") {
@@ -603,9 +597,10 @@ router.post("/send-notification-bulk", async (req, res) => {
           apnProvider.shutdown();
 
         } else if (platform === "android") {
+          // Initialize Firebase with a unique app name
           const firebaseApp = admin.initializeApp({
             credential: admin.credential.cert(require(firebaseKeyFilePath)),
-          }, `app_${company_id}_${device.device_id}`);
+          }, `app_${company_id}_${device_id}`);  // Use unique name
 
           const messageData = {
             token: token,
@@ -618,7 +613,7 @@ router.post("/send-notification-bulk", async (req, res) => {
 
           const response = await firebaseApp.messaging().send(messageData);
           responses.push({ platform, token, response });
-          admin.app(`app_${company_id}_${device.device_id}`).delete();
+          admin.app(`app_${company_id}_${device_id}`).delete(); // Clean up after sending notification
 
         } else if (platform === "huawei") {
           const huaweiKeyFile = require(huaweiKeyFilePath);
@@ -639,26 +634,6 @@ router.post("/send-notification-bulk", async (req, res) => {
   }
 });
 
-
-  router.post("/capture-event", async (req, res) => {
-    const { user_id, event_name, attributes } = req.body;
-  
-    if (!user_id || !event_name) {
-      return res.status(400).json({ error: "User ID and event name are required" });
-    }
-  
-    try {
-      // Save the event to the database
-      const event = new Event({ user_id, event_name, attributes });
-      await event.save();
-  
-      // Trigger notifications based on event rules
-      await checkEventTriggers(event);
-      res.status(201).json({ message: "Event captured successfully" });
-    } catch (error) {
-      res.status(500).json({ error: "Failed to capture event", details: error.message });
-    }
-  });
   
 
 module.exports = router;
