@@ -92,6 +92,112 @@ router.post("/register-company", upload.fields([
 });
 
 
+router.post("/organization/setup", upload.fields([
+  { name: "apn_key", maxCount: 1 },
+  { name: "firebase_service", maxCount: 1 },
+  { name: "huawei_service", maxCount: 1 }
+]), async (req, res) => {
+  const { company_id, company_name, app_id, key_id, team_id } = req.body;
+
+  try {
+    // Step 1: Handle company registration
+    if (!company_id) {
+      if (!company_name) {
+        return res.status(400).json({ error: "Company name is required for registration." });
+      }
+
+      // Check if the company already exists
+      let existingCompany = await Company.findOne({ company_name });
+      if (existingCompany) {
+        return res.status(400).json({ error: "Company already exists. Use the existing company ID." });
+      }
+
+      // Create a new company
+      const newCompanyId = `${company_name}_${Date.now()}`;
+      const newCompany = new Company({ company_name, company_id: newCompanyId, apps: [] });
+      await newCompany.save();
+
+      return res.status(200).json({
+        success: true,
+        message: "Company registered successfully.",
+        company_id: newCompanyId
+      });
+    }
+
+    // Step 2: Find the company by ID
+    const company = await Company.findOne({ company_id });
+    if (!company) {
+      return res.status(404).json({ error: "Company not found. Please provide a valid company ID." });
+    }
+
+    // Step 3: Handle app registration or platform-specific data
+    if (app_id) {
+      let app = company.apps.find(app => app.app_id === app_id);
+
+      if (!app) {
+        // App registration
+        company.apps.push({ app_id });
+        await company.save();
+
+        return res.status(200).json({
+          success: true,
+          message: "App registered successfully.",
+          company_id,
+          app_id
+        });
+      }
+
+      // Step 4: Add platform-specific data if provided
+      const appFolder = path.join("docs", `${company_id}_${app_id}`);
+      if (!fs.existsSync('docs')) {
+        fs.mkdirSync('docs', { recursive: true });
+      }
+      if (!fs.existsSync(appFolder)) {
+        fs.mkdirSync(appFolder, { recursive: true });
+      }
+
+      if (req.files.apn_key) {
+        const iosFilePath = path.join(appFolder, "ios.p8");
+        fs.renameSync(req.files.apn_key[0].path, iosFilePath);
+        app.ios_file_path = iosFilePath;
+      }
+
+      if (req.files.firebase_service) {
+        const androidFilePath = path.join(appFolder, "android.json");
+        fs.renameSync(req.files.firebase_service[0].path, androidFilePath);
+        app.android_file_path = androidFilePath;
+      }
+
+      if (req.files.huawei_service) {
+        const huaweiFilePath = path.join(appFolder, "huawei.json");
+        fs.renameSync(req.files.huawei_service[0].path, huaweiFilePath);
+        app.huawei_file_path = huaweiFilePath;
+      }
+
+      if (key_id) app.key_id = key_id;
+      if (team_id) app.team_id = team_id;
+
+      await company.save();
+
+      return res.status(200).json({
+        success: true,
+        message: "Platform-specific data added successfully.",
+        company_id,
+        app_id
+      });
+    }
+
+    // If no app_id is provided, return an error
+    return res.status(400).json({ error: "App ID is required for platform-specific data." });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "An error occurred while processing the request." });
+  }
+});
+
+
+
 
 router.post('/login', async (req, res) => {
   const { companyId } = req.body;
@@ -430,6 +536,109 @@ router.post("/send-notification-by-user", async (req, res) => {
       res.status(500).json({ error: "Failed to send notification", details: error.message });
   }
 });
+
+
+// Endpoint to send bulk notifications to all users
+router.post("/send-notification-bulk", async (req, res) => {
+  const { title, message, bundle_id, image_url, app_id, company_id, platform, category } = req.body;
+
+  if (!message || !title || !company_id || !app_id) {
+    return res.status(400).json({ error: "Title, message, company_id, and app_id are required." });
+  }
+
+  try {
+    // Validate company and app
+    const company = await Company.findOne({ company_id });
+    if (!company) {
+      return res.status(404).json({ error: "Company not found" });
+    }
+
+    const app = company.apps.find(app => app.app_id === app_id);
+    if (!app) {
+      return res.status(404).json({ error: "App not found" });
+    }
+
+    // Define file paths
+    const appFolderPath = path.join(__dirname, '..', 'docs', `${company_id}_${app_id}`);
+    const apnKeyFilePath = path.resolve(appFolderPath, 'ios.p8');
+    const firebaseKeyFilePath = path.resolve(appFolderPath, 'android.json');
+    const huaweiKeyFilePath = path.resolve(appFolderPath, 'huawei.json');
+
+    // Filter device tokens based on company_id, app_id, and optionally platform
+    const query = { company_id, platform: platform || { $exists: true }, status: true };
+    const deviceTokens = await DeviceToken.find(query);
+
+    if (deviceTokens.length === 0) {
+      return res.status(404).json({ error: "No active devices found for the specified criteria." });
+    }
+
+    // Send notifications based on platform
+    const responses = [];
+    for (const device of deviceTokens) {
+      const { platform, token } = device;
+
+      try {
+        if (platform === "ios") {
+          const apnProvider = new apn.Provider({
+            token: {
+              key: apnKeyFilePath,
+              keyId: app.key_id,
+              teamId: app.team_id,
+            },
+            production: false,
+          });
+
+          const notification = new apn.Notification();
+          notification.alert = message;
+          notification.sound = "default";
+          notification.topic = bundle_id;
+          if (category) notification.category = category;
+          if (image_url) {
+            notification.mutableContent = 1;
+            notification.payload = { "media-url": image_url };
+          }
+
+          const result = await apnProvider.send(notification, token);
+          responses.push({ platform, token, result });
+          apnProvider.shutdown();
+
+        } else if (platform === "android") {
+          const firebaseApp = admin.initializeApp({
+            credential: admin.credential.cert(require(firebaseKeyFilePath)),
+          }, `app_${company_id}_${device.device_id}`);
+
+          const messageData = {
+            token: token,
+            notification: {
+              title: title,
+              body: message,
+              image: image_url || undefined,
+            },
+          };
+
+          const response = await firebaseApp.messaging().send(messageData);
+          responses.push({ platform, token, response });
+          admin.app(`app_${company_id}_${device.device_id}`).delete();
+
+        } else if (platform === "huawei") {
+          const huaweiKeyFile = require(huaweiKeyFilePath);
+          const response = await sendHuaweiNotification(huaweiKeyFile, token, title, message, image_url);
+          responses.push({ platform, token, response });
+
+        } else {
+          responses.push({ platform, token, error: "Unsupported platform" });
+        }
+      } catch (err) {
+        responses.push({ platform, token, error: err.message });
+      }
+    }
+
+    res.status(200).json({ success: true, responses });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to send bulk notifications", details: error.message });
+  }
+});
+
 
   router.post("/capture-event", async (req, res) => {
     const { user_id, event_name, attributes } = req.body;
